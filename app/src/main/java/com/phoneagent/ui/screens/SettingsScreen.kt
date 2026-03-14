@@ -351,7 +351,7 @@ fun SettingsScreen() {
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("PhoneAgent", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                        Text("v4.0.0", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
+                        Text("v1.0", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.outline)
                     }
                     FilledTonalIconButton(onClick = { showAboutDialog = true }) {
                         Icon(Icons.Default.ChevronRight, contentDescription = "查看详情")
@@ -566,7 +566,7 @@ private fun AboutDialog(onDismiss: () -> Unit) {
                     color = MaterialTheme.colorScheme.tertiaryContainer
                 ) {
                     Text(
-                        "v4.0.0",
+                        "v1.0",
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onTertiaryContainer
