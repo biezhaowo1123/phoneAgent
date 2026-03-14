@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PhoneAgent</string>
+    <string name="accessibility_service_description">PhoneAgent 无障碍服务，用于读取屏幕内容和控制手机操作。</string>
+    <string name="notification_channel_agent">Agent 服务</string>
+    <string name="notification_channel_task">定时任务</string>
+</resources>
