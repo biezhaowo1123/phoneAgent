@@ -24,6 +24,7 @@ class AiService(private var config: AiConfig) {
 
     val currentModel: String get() = config.model
     val currentConfig: AiConfig get() = config
+    @Volatile private var strictToolNameResolution: Boolean = false
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -49,10 +50,16 @@ class AiService(private var config: AiConfig) {
         config = newConfig
     }
 
+    /** Strict mode disables fuzzy tool name matching to avoid accidental mis-invocations. */
+    fun setStrictToolNameResolution(enabled: Boolean) {
+        strictToolNameResolution = enabled
+    }
+
     /** Non-streaming chat (used in agent tool loop). */
     suspend fun chat(
         messages: List<ChatMessage>,
         tools: List<ToolDefinition> = emptyList(),
+        mustKeepTools: Boolean = false,
     ): ChatMessage = withContext(Dispatchers.IO) {
         if (config.apiKey.isEmpty()) {
             return@withContext ChatMessage(role = "assistant", content = "请先在设置中配置 API Key")
@@ -61,7 +68,7 @@ class AiService(private var config: AiConfig) {
             when (config.provider) {
                 AiProvider.CLAUDE -> chatClaude(messages, tools)
                 AiProvider.GEMINI -> chatGemini(messages, tools)
-                else -> chatOpenAI(messages, tools)
+                else -> chatOpenAI(messages, tools, mustKeepTools)
             }
         } catch (e: Exception) {
             ChatMessage(role = "assistant", content = "AI请求失败: ${e.message}")
@@ -72,6 +79,7 @@ class AiService(private var config: AiConfig) {
     fun chatStream(
         messages: List<ChatMessage>,
         tools: List<ToolDefinition> = emptyList(),
+        mustKeepTools: Boolean = false,
     ): Flow<StreamEvent> {
         return when (config.provider) {
             AiProvider.CLAUDE -> streamClaude(messages, tools)
@@ -81,7 +89,7 @@ class AiService(private var config: AiConfig) {
                 emit(StreamEvent.TextDelta(result.content))
                 emit(StreamEvent.Complete(result))
             }
-            else -> streamOpenAI(messages, tools)
+            else -> streamOpenAI(messages, tools, mustKeepTools)
         }
     }
 
@@ -116,25 +124,73 @@ class AiService(private var config: AiConfig) {
     private suspend fun chatOpenAI(
         messages: List<ChatMessage>,
         tools: List<ToolDefinition>,
+        mustKeepTools: Boolean,
     ): ChatMessage {
-        val body = buildOpenAIBody(messages, tools, stream = false)
+        val includeSampling = config.provider != AiProvider.MINIMAX
+        val includeToolChoice = config.provider != AiProvider.MINIMAX
+        val body = buildOpenAIBody(
+            messages = messages,
+            tools = tools,
+            stream = false,
+            maxContextMessages = 18,
+            maxContextChars = 12_000,
+            includeSampling = includeSampling,
+            includeToolChoice = includeToolChoice,
+        )
         val preset = AiConfig.PRESETS[config.provider]
         val authType = preset?.authType ?: "Bearer"
+        val url = "${config.baseUrl}/chat/completions"
 
-        val response = client.post("${config.baseUrl}/chat/completions") {
-            if (authType == "Bearer") {
-                header("Authorization", "Bearer ${config.apiKey}")
-            } else {
-                header(authType, config.apiKey)
+        suspend fun postBody(reqBody: JsonObject): Pair<HttpResponse, String> {
+            val response = client.post(url) {
+                if (authType == "Bearer") {
+                    header("Authorization", "Bearer ${config.apiKey}")
+                } else {
+                    header(authType, config.apiKey)
+                }
+                if (config.provider == AiProvider.OPENROUTER) {
+                    header("HTTP-Referer", "https://phoneagent.app")
+                    header("X-Title", "PhoneAgent")
+                }
+                jsonBody(reqBody)
             }
-            if (config.provider == AiProvider.OPENROUTER) {
-                header("HTTP-Referer", "https://phoneagent.app")
-                header("X-Title", "PhoneAgent")
-            }
-            jsonBody(body)
+            val responseText = try { response.body<String>() } catch (_: Exception) { "" }
+            return response to responseText
         }
 
-        val responseJson = json.parseToJsonElement(response.body<String>()).jsonObject
+        var (response, responseText) = postBody(body)
+        if (shouldRetryWithRelaxedChatSettings(response.status.value, responseText)) {
+            val retryPlans = buildOpenAIRetryPlans(
+                messages = messages,
+                tools = tools,
+                stream = false,
+                allowDisableTools = !mustKeepTools,
+            )
+            for ((index, plan) in retryPlans.withIndex()) {
+                android.util.Log.w(
+                    "AiService",
+                    "chatOpenAI: invalid chat setting, retry ${index + 1}/${retryPlans.size} -> ${plan.first}"
+                )
+                val retried = postBody(plan.second)
+                response = retried.first
+                responseText = retried.second
+                if (response.status.value in 200..299) break
+                if (!shouldRetryWithRelaxedChatSettings(response.status.value, responseText)) break
+            }
+        }
+
+        if (response.status.value !in 200..299) {
+            return ChatMessage(
+                role = "assistant",
+                content = "API返回错误(${response.status.value}): $responseText"
+            )
+        }
+
+        val responseJson = try {
+            json.parseToJsonElement(responseText).jsonObject
+        } catch (e: Exception) {
+            return ChatMessage(role = "assistant", content = "解析响应失败: ${e.message}")
+        }
         val choice = responseJson["choices"]?.jsonArray?.firstOrNull()?.jsonObject
         val message = choice?.get("message")?.jsonObject
         val content = message?.get("content")?.jsonPrimitive?.contentOrNull ?: ""
@@ -178,96 +234,132 @@ class AiService(private var config: AiConfig) {
     private fun streamOpenAI(
         messages: List<ChatMessage>,
         tools: List<ToolDefinition>,
+        mustKeepTools: Boolean,
     ): Flow<StreamEvent> = channelFlow {
         try {
-            val body = buildOpenAIBody(messages, tools, stream = true)
+            val includeSampling = config.provider != AiProvider.MINIMAX
+            val includeToolChoice = config.provider != AiProvider.MINIMAX
+            val body = buildOpenAIBody(
+                messages = messages,
+                tools = tools,
+                stream = true,
+                maxContextMessages = 18,
+                maxContextChars = 12_000,
+                includeSampling = includeSampling,
+                includeToolChoice = includeToolChoice,
+            )
             val preset = AiConfig.PRESETS[config.provider]
             val authType = preset?.authType ?: "Bearer"
             val url = "${config.baseUrl}/chat/completions"
             android.util.Log.d("AiService", "streamOpenAI: POST $url, bodyLen=${body.toString().length}")
 
-            client.preparePost(url) {
-                accept(ContentType.Text.EventStream)
-                if (authType == "Bearer") {
-                    header("Authorization", "Bearer ${config.apiKey}")
-                } else {
-                    header(authType, config.apiKey)
-                }
-                if (config.provider == AiProvider.OPENROUTER) {
-                    header("HTTP-Referer", "https://phoneagent.app")
-                    header("X-Title", "PhoneAgent")
-                }
-                jsonBody(body)
-            }.execute { httpResponse ->
-                android.util.Log.d("AiService", "streamOpenAI: status=${httpResponse.status}")
-                if (httpResponse.status.value !in 200..299) {
-                    val errBody = try { httpResponse.body<String>() } catch (_: Exception) { "unknown" }
-                    android.util.Log.e("AiService", "streamOpenAI: error response: $errBody")
-                    send(StreamEvent.TextDelta("API返回错误(${httpResponse.status.value}): $errBody"))
-                    send(StreamEvent.Complete(ChatMessage(role = "assistant", content = "API返回错误(${httpResponse.status.value}): $errBody")))
-                    return@execute
-                }
-                val fullContent = StringBuilder()
-                val toolCallAcc = mutableMapOf<Int, Pair<StringBuilder, StringBuilder>>()
+            val retryPlans = buildOpenAIRetryPlans(
+                messages = messages,
+                tools = tools,
+                stream = true,
+                allowDisableTools = !mustKeepTools,
+            )
 
-                val channel = httpResponse.bodyAsChannel()
-                while (!channel.isClosedForRead) {
-                    val line = channel.readUTF8Line() ?: break
-                    if (!line.startsWith("data: ")) continue
-                    val data = line.removePrefix("data: ").trim()
-                    if (data == "[DONE]") break
-
-                    try {
-                        val obj = json.parseToJsonElement(data).jsonObject
-                        val delta = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
-                            ?.get("delta")?.jsonObject ?: continue
-
-                        delta["content"]?.jsonPrimitive?.contentOrNull?.let { text ->
-                            fullContent.append(text)
-                            send(StreamEvent.TextDelta(text))
-                        }
-
-                        delta["tool_calls"]?.jsonArray?.forEach { tc ->
-                            val tcObj = tc.jsonObject
-                            val idx = tcObj["index"]?.jsonPrimitive?.int ?: 0
-                            val fn = tcObj["function"]?.jsonObject
-                            val pair = toolCallAcc.getOrPut(idx) { StringBuilder() to StringBuilder() }
-                            fn?.get("name")?.jsonPrimitive?.contentOrNull?.let { pair.first.append(it) }
-                            fn?.get("arguments")?.jsonPrimitive?.contentOrNull?.let { pair.second.append(it) }
-                        }
-                    } catch (_: Exception) { }
-                }
-
-                val toolCalls = if (toolCallAcc.isNotEmpty()) {
-                    toolCallAcc.entries.sortedBy { it.key }.map { (_, pair) ->
-                        ToolCall(
-                            name = pair.first.toString(),
-                            arguments = try {
-                                json.parseToJsonElement(pair.second.toString()).jsonObject
-                                    .mapValues { it.value.jsonPrimitive.content }
-                            } catch (_: Exception) { emptyMap() }
-                        )
+            suspend fun runStreamRequest(
+                requestBody: JsonObject,
+                remainingRetryPlans: List<Pair<String, JsonObject>>,
+            ) {
+                client.preparePost(url) {
+                    accept(ContentType.Text.EventStream)
+                    if (authType == "Bearer") {
+                        header("Authorization", "Bearer ${config.apiKey}")
+                    } else {
+                        header(authType, config.apiKey)
                     }
-                } else null
+                    if (config.provider == AiProvider.OPENROUTER) {
+                        header("HTTP-Referer", "https://phoneagent.app")
+                        header("X-Title", "PhoneAgent")
+                    }
+                    jsonBody(requestBody)
+                }.execute { httpResponse ->
+                    android.util.Log.d("AiService", "streamOpenAI: status=${httpResponse.status}")
+                    if (httpResponse.status.value !in 200..299) {
+                        val errBody = try { httpResponse.body<String>() } catch (_: Exception) { "unknown" }
+                        if (remainingRetryPlans.isNotEmpty() &&
+                            shouldRetryWithRelaxedChatSettings(httpResponse.status.value, errBody)
+                        ) {
+                            val nextPlan = remainingRetryPlans.first()
+                            android.util.Log.w(
+                                "AiService",
+                                "streamOpenAI: invalid chat setting, retry -> ${nextPlan.first}"
+                            )
+                            runStreamRequest(nextPlan.second, remainingRetryPlans.drop(1))
+                            return@execute
+                        }
+                        android.util.Log.e("AiService", "streamOpenAI: error response: $errBody")
+                        send(StreamEvent.TextDelta("API返回错误(${httpResponse.status.value}): $errBody"))
+                        send(StreamEvent.Complete(ChatMessage(role = "assistant", content = "API返回错误(${httpResponse.status.value}): $errBody")))
+                        return@execute
+                    }
 
-                // If no standard tool_calls found, try parsing from text content
-                val finalContent: String
-                val finalToolCalls: List<ToolCall>?
-                if (toolCalls.isNullOrEmpty()) {
-                    val (cleaned, parsed) = parseToolCallsFromText(fullContent.toString())
-                    finalContent = cleaned
-                    finalToolCalls = parsed.ifEmpty { null }
-                } else {
-                    finalContent = fullContent.toString()
-                    finalToolCalls = toolCalls
+                    val fullContent = StringBuilder()
+                    val toolCallAcc = mutableMapOf<Int, Pair<StringBuilder, StringBuilder>>()
+
+                    val channel = httpResponse.bodyAsChannel()
+                    while (!channel.isClosedForRead) {
+                        val line = channel.readUTF8Line() ?: break
+                        if (!line.startsWith("data: ")) continue
+                        val data = line.removePrefix("data: ").trim()
+                        if (data == "[DONE]") break
+
+                        try {
+                            val obj = json.parseToJsonElement(data).jsonObject
+                            val delta = obj["choices"]?.jsonArray?.firstOrNull()?.jsonObject
+                                ?.get("delta")?.jsonObject ?: continue
+
+                            delta["content"]?.jsonPrimitive?.contentOrNull?.let { text ->
+                                fullContent.append(text)
+                                send(StreamEvent.TextDelta(text))
+                            }
+
+                            delta["tool_calls"]?.jsonArray?.forEach { tc ->
+                                val tcObj = tc.jsonObject
+                                val idx = tcObj["index"]?.jsonPrimitive?.int ?: 0
+                                val fn = tcObj["function"]?.jsonObject
+                                val pair = toolCallAcc.getOrPut(idx) { StringBuilder() to StringBuilder() }
+                                fn?.get("name")?.jsonPrimitive?.contentOrNull?.let { pair.first.append(it) }
+                                fn?.get("arguments")?.jsonPrimitive?.contentOrNull?.let { pair.second.append(it) }
+                            }
+                        } catch (_: Exception) { }
+                    }
+
+                    val toolCalls = if (toolCallAcc.isNotEmpty()) {
+                        toolCallAcc.entries.sortedBy { it.key }.map { (_, pair) ->
+                            ToolCall(
+                                name = pair.first.toString(),
+                                arguments = try {
+                                    json.parseToJsonElement(pair.second.toString()).jsonObject
+                                        .mapValues { it.value.jsonPrimitive.content }
+                                } catch (_: Exception) { emptyMap() }
+                            )
+                        }
+                    } else null
+
+                    // If no standard tool_calls found, try parsing from text content
+                    val finalContent: String
+                    val finalToolCalls: List<ToolCall>?
+                    if (toolCalls.isNullOrEmpty()) {
+                        val (cleaned, parsed) = parseToolCallsFromText(fullContent.toString())
+                        finalContent = cleaned
+                        finalToolCalls = parsed.ifEmpty { null }
+                    } else {
+                        finalContent = fullContent.toString()
+                        finalToolCalls = toolCalls
+                    }
+
+                    send(StreamEvent.Complete(ChatMessage(
+                        role = "assistant",
+                        content = finalContent,
+                        toolCalls = finalToolCalls
+                    )))
                 }
-
-                send(StreamEvent.Complete(ChatMessage(
-                    role = "assistant",
-                    content = finalContent,
-                    toolCalls = finalToolCalls
-                )))
             }
+            runStreamRequest(body, retryPlans)
         } catch (e: Exception) {
             android.util.Log.e("AiService", "streamOpenAI exception", e)
             val errorMsg = when {
@@ -492,12 +584,15 @@ class AiService(private var config: AiConfig) {
         messages: List<ChatMessage>,
         tools: List<ToolDefinition>,
         stream: Boolean,
+        maxContextMessages: Int = 18,
+        maxContextChars: Int = 12_000,
+        includeSampling: Boolean = true,
+        includeTools: Boolean = true,
+        includeToolChoice: Boolean = true,
     ): JsonObject {
         // --- 1. Trim history to avoid context overflow (MiniMax 2013 error) ---
-        val MAX_CONTEXT_MESSAGES = 30
-        val trimmed = if (messages.size > MAX_CONTEXT_MESSAGES) {
-            // Keep first user message (original request) + most recent messages
-            listOf(messages.first()) + messages.takeLast(MAX_CONTEXT_MESSAGES - 1)
+        val trimmed = if (messages.size > maxContextMessages) {
+            messages.takeLast(maxContextMessages)
         } else {
             messages
         }
@@ -519,19 +614,36 @@ class AiService(private var config: AiConfig) {
             }
         }
 
-        android.util.Log.d("AiService", "buildOpenAIBody: ${messages.size} msgs → ${processed.size} processed, roles=${processed.joinToString(",") { it.role }}")
+        // --- 3. Enforce character budget from newest to oldest ---
+        val budgetedReversed = mutableListOf<Msg>()
+        var usedChars = 0
+        for (msg in processed.asReversed()) {
+            val clipped = if (msg.content.length > 2_500) msg.content.takeLast(2_500) else msg.content
+            val estimated = clipped.length + (if (!msg.images.isNullOrEmpty()) 1_000 else 0)
+            if (budgetedReversed.isNotEmpty() && usedChars + estimated > maxContextChars) break
+            budgetedReversed.add(msg.copy(content = clipped))
+            usedChars += estimated
+        }
+        val finalMessages = budgetedReversed.asReversed()
+
+        android.util.Log.d(
+            "AiService",
+            "buildOpenAIBody: ${messages.size} msgs → ${finalMessages.size} msgs, chars=$usedChars, roles=${finalMessages.joinToString(",") { it.role }}"
+        )
 
         return buildJsonObject {
             put("model", config.model)
-            put("max_tokens", config.maxTokens)
-            put("temperature", config.temperature)
+            if (includeSampling) {
+                put("max_tokens", config.maxTokens)
+                put("temperature", config.temperature)
+            }
             if (stream) put("stream", true)
             putJsonArray("messages") {
                 addJsonObject {
                     put("role", "system")
                     put("content", config.systemPrompt)
                 }
-                processed.forEach { pm ->
+                finalMessages.forEach { pm ->
                     addJsonObject {
                         put("role", pm.role)
                         if (!pm.images.isNullOrEmpty() && pm.role == "user") {
@@ -555,8 +667,10 @@ class AiService(private var config: AiConfig) {
                     }
                 }
             }
-            if (tools.isNotEmpty()) {
-                put("tool_choice", "auto")
+            if (includeTools && tools.isNotEmpty()) {
+                if (includeToolChoice) {
+                    put("tool_choice", "auto")
+                }
                 putJsonArray("tools") {
                     tools.forEach { tool ->
                         addJsonObject {
@@ -587,6 +701,70 @@ class AiService(private var config: AiConfig) {
                 }
             }
         }
+    }
+
+    private fun shouldRetryWithRelaxedChatSettings(statusCode: Int, body: String): Boolean {
+        if (statusCode != 400) return false
+        val normalized = body.lowercase()
+        return normalized.contains("invalid chat setting") ||
+            normalized.contains("(2013)") ||
+            normalized.contains(" 2013") ||
+            (normalized.contains("badrequesterror") && normalized.contains("invalid params")) ||
+            normalized.contains("context length") ||
+            normalized.contains("maximum context")
+    }
+
+    /**
+     * Retry plans for OpenAI-compatible APIs:
+     * 1) 保留 tools，只缩短上下文；
+     * 2) 仍失败时才关闭 tools 作为兜底。
+     */
+    private fun buildOpenAIRetryPlans(
+        messages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+        stream: Boolean,
+        allowDisableTools: Boolean = true,
+    ): List<Pair<String, JsonObject>> {
+        val keepToolsCompact = buildOpenAIBody(
+            messages = messages,
+            tools = tools,
+            stream = stream,
+            maxContextMessages = 10,
+            maxContextChars = 6_000,
+            includeSampling = false,
+            includeTools = true,
+            includeToolChoice = false,
+        )
+        val keepToolsUltraCompact = buildOpenAIBody(
+            messages = messages,
+            tools = tools,
+            stream = stream,
+            maxContextMessages = 8,
+            maxContextChars = 4_000,
+            includeSampling = false,
+            includeTools = true,
+            includeToolChoice = false,
+        )
+
+        val plans = mutableListOf<Pair<String, JsonObject>>(
+            "保留工具+缩短上下文" to keepToolsCompact,
+            "保留工具+极限压缩上下文" to keepToolsUltraCompact,
+        )
+
+        if (allowDisableTools) {
+            val noTools = buildOpenAIBody(
+                messages = messages,
+                tools = tools,
+                stream = stream,
+                maxContextMessages = 8,
+                maxContextChars = 3_500,
+                includeSampling = false,
+                includeTools = false,
+                includeToolChoice = false,
+            )
+            plans.add("关闭工具+极限压缩上下文" to noTools)
+        }
+        return plans
     }
 
     private fun buildClaudeBody(
@@ -811,8 +989,9 @@ class AiService(private var config: AiConfig) {
 
     /** Resolve a possibly malformed tool name to the correct one. */
     private fun resolveToolName(raw: String): String {
+        val trimmed = raw.trim()
         // Already correct format
-        if (raw.contains('_') && raw.length > 3) return raw
+        if (trimmed.contains('_') && trimmed.length > 3) return trimmed
 
         // Build lookup from known tool names (lowercase no-underscore → real name)
         val knownTools = listOf(
@@ -822,17 +1001,27 @@ class AiService(private var config: AiConfig) {
             "scheduler_create", "scheduler_list", "scheduler_delete",
         )
         val lookup = knownTools.associateBy { it.replace("_", "").lowercase() }
-        val normalized = raw.replace("_", "").lowercase()
+        val normalized = trimmed.replace("_", "").lowercase()
         lookup[normalized]?.let { return it }
+
+        val inferredByPrefix = inferToolNameByPrefix(trimmed)
+        if (strictToolNameResolution) {
+            return inferredByPrefix ?: trimmed
+        }
 
         // Fuzzy: find best match
         val best = knownTools.minByOrNull { levenshtein(it.replace("_", "").lowercase(), normalized) }
         if (best != null && levenshtein(best.replace("_", "").lowercase(), normalized) <= 3) {
-            android.util.Log.d("AiService", "resolveToolName: '$raw' → '$best' (fuzzy)")
+            android.util.Log.d("AiService", "resolveToolName: '$trimmed' → '$best' (fuzzy)")
             return best
         }
 
         // Fallback: try to add underscores by prefix
+        if (inferredByPrefix != null) return inferredByPrefix
+        return trimmed
+    }
+
+    private fun inferToolNameByPrefix(raw: String): String? {
         val prefixes = listOf("device", "browser", "node", "scheduler", "sessions")
         for (prefix in prefixes) {
             if (raw.startsWith(prefix, ignoreCase = true) && raw.length > prefix.length) {
@@ -842,10 +1031,10 @@ class AiService(private var config: AiConfig) {
                     else acc.last().append(c)
                     acc
                 }.joinToString("_")
-                return "${prefix}_$words"
+                return if (words.isNotBlank()) "${prefix}_$words" else null
             }
         }
-        return raw
+        return null
     }
 
     /** Simple Levenshtein distance for fuzzy tool name matching. */

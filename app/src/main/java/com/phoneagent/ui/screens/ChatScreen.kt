@@ -30,7 +30,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -47,6 +50,9 @@ import java.util.*
 @Composable
 fun ChatScreen() {
     val context = LocalContext.current
+    val density = LocalDensity.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val engine = remember { AgentEngine.getInstance(context) }
     val messages by engine.conversationHistory.collectAsState()
     val isProcessing by engine.isProcessing.collectAsState()
@@ -60,6 +66,9 @@ fun ChatScreen() {
     var showMoreMenu by remember { mutableStateOf(false) }
     var selectedMessageIndex by remember { mutableStateOf(-1) }
     var pendingImages by remember { mutableStateOf<List<String>>(emptyList()) }
+    val imeBottom = WindowInsets.ime.getBottom(density)
+    val navBottom = WindowInsets.navigationBars.getBottom(density)
+    val keyboardBottomPadding = with(density) { (imeBottom - navBottom).coerceAtLeast(0).toDp() }
 
     // Image picker
     val imagePickerLauncher = rememberLauncherForActivityResult(
@@ -286,6 +295,9 @@ fun ChatScreen() {
 
         // Input bar
         Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = keyboardBottomPadding),
             tonalElevation = 2.dp,
             shadowElevation = 4.dp
         ) {
@@ -348,6 +360,8 @@ fun ChatScreen() {
                                 val images = pendingImages.ifEmpty { null }
                                 inputText = ""
                                 pendingImages = emptyList()
+                                focusManager.clearFocus(force = true)
+                                keyboardController?.hide()
                                 scope.launch {
                                     try {
                                         engine.chatStream(text, images)

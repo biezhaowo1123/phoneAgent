@@ -23,7 +23,7 @@ OpenAI · Claude · Gemini · DeepSeek · 通义千问 · 智谱GLM · 月之暗
 AI 自动选择工具并链式调用，最多 30 轮迭代，流式输出 + Markdown 实时渲染
 
 **🧩 Skill 插件**
-6 个内置技能（电话短信、应用管理、通知、系统设置、文件管理、剪贴板），可扩展
+8 个内置技能（电话短信、应用管理、通知、系统设置、文件管理、剪贴板、即时消息、本地流程执行），可扩展
 
 **⏰ 定时任务**
 一次性 / 每天 / 每周 / 工作日 / 间隔 / Cron，基于 WorkManager 持久化调度，开机自动恢复
@@ -73,8 +73,60 @@ TTS 文字转语音，可调语速，每条消息可点击朗读
 | 每天下午6点提醒我下班 | 创建每日定时通知 |
 | 读一下屏幕上写了什么 | 无障碍服务读取屏幕内容 |
 | 帮我复制一下这段话 | 读取并复制到剪贴板 |
+| 在微信给张三发“我到了” | 自动定位联系人并发送消息 |
 | 电量还有多少 | 查询电池状态 |
 | 30分钟后提醒我开会 | 创建倒计时任务 |
+
+### 即时消息 Skill（微信/QQ）
+
+- 工具名：`skill_im_send_message`
+- 参数：
+  - `app`: `wechat` 或 `qq`
+  - `to`: 联系人名称（建议与通讯录显示名完全一致）
+  - `message`: 要发送的内容
+  - `mode`: `precise`（最稳）、`balanced`（推荐）、`fast`（最快）
+- 示例：
+  - `app=wechat,to=张三,message=我到了,mode=balanced`
+  - `app=qq,to=李四,message=10分钟后到,mode=fast`
+
+### 本地流程执行 Skill（全手机执行）
+
+- 工具名：`skill_flow_run_workflow`
+- 参数：
+  - `script_json`: JSON 流程（必填）
+  - `mode`: `precise` / `balanced` / `fast`（可选）
+  - `timeout_ms`: 全流程超时（可选）
+  - `continue_on_error`: 出错是否继续（可选）
+- 支持动作（`action`）：
+  - `launch_app` / `stop_app`
+  - `click_text` / `click_xy`
+  - `input_text`
+  - `swipe`（方向或坐标）
+  - `press`
+  - `wait`
+  - `assert_contains`
+  - `screenshot`
+  - `shell`
+- 示例：
+
+```json
+{
+  "defaults": {
+    "step_timeout_ms": 6000,
+    "retries": 1,
+    "retry_delay_ms": 220,
+    "continue_on_error": false
+  },
+  "steps": [
+    { "action": "launch_app", "package": "com.android.settings" },
+    { "action": "wait", "wait_ms": 500 },
+    { "action": "click_text", "text": "搜索" },
+    { "action": "input_text", "text": "WLAN" },
+    { "action": "press", "key": "enter" },
+    { "action": "assert_contains", "expect_text": "WLAN" }
+  ]
+}
+```
 
 ---
 
@@ -97,7 +149,7 @@ app/src/main/java/com/phoneagent/
 ├── skill/                     # Skill 插件系统
 │   ├── Skill.kt              #   Skill 接口
 │   ├── SkillRegistry.kt      #   注册中心
-│   └── builtin/              #   6 个内置技能
+│   └── builtin/              #   7 个内置技能
 ├── scheduler/                 # 定时任务
 │   ├── TaskScheduler.kt      #   调度核心
 │   ├── TaskWorker.kt         #   WorkManager Worker

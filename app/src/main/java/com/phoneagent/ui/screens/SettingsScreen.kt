@@ -36,6 +36,7 @@ fun SettingsScreen() {
     val engine = remember { AgentEngine.getInstance(context) }
     val a11yRunning by AgentAccessibilityService.isRunning.collectAsState()
     val currentControlMode by engine.deviceManager.controlMode.collectAsState()
+    val precisionMode by engine.deviceManager.precisionMode.collectAsState()
     val themeOverride = LocalThemeOverride.current
 
     var apiKey by remember { mutableStateOf(engine.aiService.currentConfig.apiKey) }
@@ -110,6 +111,36 @@ fun SettingsScreen() {
                 }
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "精准模式",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    "优先无障碍并自动回退控制器，减少误操作",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = precisionMode,
+                                onCheckedChange = { engine.deviceManager.setPrecisionMode(it) }
+                            )
+                        }
+                    }
+
                     controllerStatus.forEach { (mode, available) ->
                         ControlModeItem(
                             mode = mode,
@@ -125,7 +156,11 @@ fun SettingsScreen() {
                         available = true,
                         selected = currentControlMode == ControlMode.AUTO,
                         onClick = { engine.deviceManager.setControlMode(ControlMode.AUTO) },
-                        description = "优先级: Shizuku > Root > 无障碍 > Shell"
+                        description = if (precisionMode) {
+                            "优先级: 无障碍 > Shizuku > Root > Shell"
+                        } else {
+                            "优先级: Shizuku > Root > 无障碍 > Shell"
+                        }
                     )
                 }
 

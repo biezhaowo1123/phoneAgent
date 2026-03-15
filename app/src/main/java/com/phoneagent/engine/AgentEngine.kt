@@ -55,6 +55,15 @@ class AgentEngine private constructor(private val context: Context) {
     /** Job reference for the current chat, used for cancellation. */
     private var currentChatJob: kotlinx.coroutines.Job? = null
 
+    init {
+        aiService.setStrictToolNameResolution(deviceManager.precisionMode.value)
+        scope.launch {
+            deviceManager.precisionMode.collect { enabled ->
+                aiService.setStrictToolNameResolution(enabled)
+            }
+        }
+    }
+
     companion object {
         @Volatile private var INSTANCE: AgentEngine? = null
 
@@ -67,6 +76,10 @@ class AgentEngine private constructor(private val context: Context) {
         const val MAX_CONTEXT_MESSAGES = 50
         const val SUMMARY_TRIGGER_COUNT = 40
         const val MAX_ITERATIONS = 30
+        const val STREAM_ROUND_TIMEOUT_MS = 300_000L
+        const val NON_STREAM_ROUND_TIMEOUT_MS = 240_000L
+        const val TOOL_EXEC_TIMEOUT_MS = 60_000L
+        const val ASSISTANT_ROUND_RETRIES = 3
     }
 
     // ========================================================================
@@ -171,6 +184,7 @@ class AgentEngine private constructor(private val context: Context) {
 
         try {
             var iterationCount = 0
+            var executedToolInRun = false
             while (iterationCount < MAX_ITERATIONS) {
                 iterationCount++
 
@@ -178,7 +192,18 @@ class AgentEngine private constructor(private val context: Context) {
                 val aiMessages = if (contextMessages.size < messages.size) contextMessages else messages
                 val tools = gatherAllTools()
 
-                val response = aiService.chat(aiMessages, tools)
+                val baseResponse = requestAssistantRoundNonStreaming(
+                    aiMessages = aiMessages,
+                    tools = tools,
+                )
+                val response = recoverToolCallIfNeeded(
+                    userMessage = userMessage,
+                    aiMessages = aiMessages,
+                    tools = tools,
+                    response = baseResponse,
+                    iteration = iterationCount,
+                    executedToolInRun = executedToolInRun
+                )
                 conversationManager.saveMessage(response)
                 messages.add(response)
                 _conversationHistory.value = messages.toList()
@@ -189,7 +214,8 @@ class AgentEngine private constructor(private val context: Context) {
                 }
 
                 for (toolCall in response.toolCalls) {
-                    val result = executeTool(toolCall.name, toolCall.arguments)
+                    executedToolInRun = true
+                    val result = executeToolSafely(toolCall.name, toolCall.arguments)
                     val toolMsg = ChatMessage(role = "tool", content = "[${toolCall.name}] $result")
                     conversationManager.saveMessage(toolMsg)
                     messages.add(toolMsg)
@@ -212,6 +238,193 @@ class AgentEngine private constructor(private val context: Context) {
     /** Strip <think>...</think> tags from model responses (reasoning tokens). */
     private fun stripThinkTags(text: String): String {
         return text.replace(Regex("""<think>[\s\S]*?</think>\s*"""), "").trimStart()
+    }
+
+    private fun isTransientAssistantRoundFailure(response: ChatMessage): Boolean {
+        if (!response.toolCalls.isNullOrEmpty()) return false
+        val content = response.content.trim()
+        if (content.isEmpty()) return true
+        return content.startsWith("API返回错误(") ||
+            content.startsWith("AI请求失败:") ||
+            content.startsWith("解析响应失败:") ||
+            content.contains("invalid chat setting", ignoreCase = true) ||
+            content.contains("请求超时") ||
+            content.contains("timed out", ignoreCase = true)
+    }
+
+    private fun isLikelyAutomationRequest(text: String): Boolean {
+        val keywords = listOf(
+            "打开", "启动", "发送", "点击", "输入", "滑动", "返回", "搜索", "读取", "截图",
+            "launch", "open", "send", "click", "type", "swipe", "back", "search", "screenshot"
+        )
+        return keywords.any { text.contains(it, ignoreCase = true) }
+    }
+
+    private fun looksLikeCompletionText(text: String): Boolean {
+        val doneKeywords = listOf(
+            "已完成", "完成了", "已发送", "发送成功", "已经发送", "已执行", "任务完成",
+            "done", "completed", "success", "finished"
+        )
+        return doneKeywords.any { text.contains(it, ignoreCase = true) }
+    }
+
+    private fun shouldRecoverMissingToolCall(
+        userMessage: String,
+        response: ChatMessage,
+        iteration: Int,
+        executedToolInRun: Boolean,
+    ): Boolean {
+        if (!response.toolCalls.isNullOrEmpty()) return false
+        if (iteration >= MAX_ITERATIONS) return false
+        val content = response.content.trim()
+        if (looksLikeCompletionText(content)) return false
+
+        val automationIntent = executedToolInRun || isLikelyAutomationRequest(userMessage)
+        if (!automationIntent) return false
+
+        // Model is still "planning"/"describing next step" but forgot tool_calls.
+        val planningHints = listOf("让我", "我需要", "接下来", "然后", "先", "下一步", "需要点击", "需要打开")
+        val actionHints = listOf("点击", "打开", "输入", "发送", "搜索", "返回", "进入", "读取", "查看")
+        val looksLikePlan = planningHints.any { content.contains(it) } ||
+            actionHints.any { content.contains(it) } ||
+            content.length < 16
+        return looksLikePlan
+    }
+
+    private suspend fun recoverToolCallIfNeeded(
+        userMessage: String,
+        aiMessages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+        response: ChatMessage,
+        iteration: Int,
+        executedToolInRun: Boolean,
+    ): ChatMessage {
+        if (!shouldRecoverMissingToolCall(userMessage, response, iteration, executedToolInRun)) {
+            return response
+        }
+
+        val nudge = ChatMessage(
+            role = "user",
+            content = "继续执行当前设备任务。不要解释，不要总结，直接调用下一步最合适的工具。如果不确定，先调用 device_read_screen。"
+        )
+        val recovered = requestAssistantRoundNonStreaming(aiMessages + nudge, tools)
+        return if (!recovered.toolCalls.isNullOrEmpty()) {
+            android.util.Log.w("AgentEngine", "Recovered missing tool_call at iteration $iteration")
+            recovered
+        } else if (isLikelyAutomationRequest(userMessage) && iteration < MAX_ITERATIONS) {
+            android.util.Log.w("AgentEngine", "Recovery still missing tool_call at iteration $iteration, inject device_read_screen")
+            response.copy(
+                content = if (response.content.isBlank()) "（自动补救：读取屏幕）" else response.content,
+                toolCalls = listOf(ToolCall(name = "device_read_screen", arguments = emptyMap()))
+            )
+        } else {
+            response
+        }
+    }
+
+    private suspend fun requestAssistantRound(
+        aiMessages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+        allowStreaming: Boolean,
+    ): ChatMessage {
+        var lastResponse: ChatMessage? = null
+        for (attempt in 1..ASSISTANT_ROUND_RETRIES) {
+            val useStreaming = allowStreaming && attempt == 1
+            val response = if (useStreaming) {
+                requestAssistantRoundStreaming(aiMessages, tools)
+            } else {
+                requestAssistantRoundNonStreaming(aiMessages, tools)
+            }
+            lastResponse = response
+
+            if (!isTransientAssistantRoundFailure(response)) {
+                return response
+            }
+            android.util.Log.w(
+                "AgentEngine",
+                "assistant round transient failure, retry attempt=$attempt/$ASSISTANT_ROUND_RETRIES, content='${response.content.take(120)}'"
+            )
+            kotlinx.coroutines.delay((attempt * 500L).coerceAtMost(1500L))
+        }
+        return lastResponse ?: ChatMessage(
+            role = "assistant",
+            content = "请求失败：未获得有效响应，请稍后重试。"
+        )
+    }
+
+    private suspend fun requestAssistantRoundStreaming(
+        aiMessages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+    ): ChatMessage {
+        _streamingText.value = ""
+        var completedMessage: ChatMessage? = null
+        val streamBuffer = StringBuilder()
+
+        val streamFinished = withTimeoutOrNull(STREAM_ROUND_TIMEOUT_MS) {
+            aiService.chatStream(
+                messages = aiMessages,
+                tools = tools,
+                mustKeepTools = tools.isNotEmpty()
+            ).collect { event ->
+                when (event) {
+                    is StreamEvent.TextDelta -> {
+                        streamBuffer.append(event.text)
+                        _streamingText.value = stripThinkTags(streamBuffer.toString())
+                    }
+                    is StreamEvent.Complete -> {
+                        completedMessage = event.message
+                    }
+                }
+            }
+            true
+        } ?: false
+
+        _streamingText.value = ""
+        if (!streamFinished) {
+            android.util.Log.w("AgentEngine", "chatStream: streaming round timed out")
+            return ChatMessage(
+                role = "assistant",
+                content = "请求超时，正在切换稳定模式重试。"
+            )
+        }
+
+        val rawResponse = completedMessage ?: ChatMessage("assistant", streamBuffer.toString())
+        val cleanContent = stripThinkTags(rawResponse.content)
+        return rawResponse.copy(content = cleanContent)
+    }
+
+    private suspend fun requestAssistantRoundNonStreaming(
+        aiMessages: List<ChatMessage>,
+        tools: List<ToolDefinition>,
+    ): ChatMessage {
+        val response = withTimeoutOrNull(NON_STREAM_ROUND_TIMEOUT_MS) {
+            aiService.chat(
+                messages = aiMessages,
+                tools = tools,
+                mustKeepTools = tools.isNotEmpty()
+            )
+        } ?: ChatMessage(
+            role = "assistant",
+            content = "请求超时，稳定模式也未在时限内返回。"
+        )
+        return response.copy(content = stripThinkTags(response.content))
+    }
+
+    private suspend fun executeToolSafely(
+        toolName: String,
+        arguments: Map<String, String>,
+    ): String {
+        return try {
+            withTimeout(TOOL_EXEC_TIMEOUT_MS) {
+                executeTool(toolName, arguments)
+            }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            "Error: 工具执行超时（>${TOOL_EXEC_TIMEOUT_MS / 1000}s）"
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "Error: 工具执行失败 - ${e.message}"
+        }
     }
 
     // ========================================================================
@@ -253,6 +466,7 @@ class AgentEngine private constructor(private val context: Context) {
             messages.add(userMsg)
             _conversationHistory.value = messages.toList()
             var iterationCount = 0
+            var executedToolInRun = false
             while (iterationCount < MAX_ITERATIONS) {
                 iterationCount++
                 android.util.Log.d("AgentEngine", "chatStream: iteration $iterationCount")
@@ -260,54 +474,58 @@ class AgentEngine private constructor(private val context: Context) {
                 val contextMessages = conversationManager.getContextMessages(MAX_CONTEXT_MESSAGES)
                 val aiMessages = if (contextMessages.size < messages.size) contextMessages else messages
                 val tools = gatherAllTools()
-                android.util.Log.d("AgentEngine", "chatStream: calling aiService.chatStream with ${aiMessages.size} msgs, ${tools.size} tools, url=${aiService.currentConfig.baseUrl}")
-
-                _streamingText.value = ""
-                var completedMessage: ChatMessage? = null
-
-                aiService.chatStream(aiMessages, tools).collect { event ->
-                    when (event) {
-                        is StreamEvent.TextDelta -> {
-                            _streamingText.value += event.text
-                            // Live-strip <think> tags for cleaner streaming display
-                            val stripped = stripThinkTags(_streamingText.value)
-                            if (stripped != _streamingText.value) {
-                                _streamingText.value = stripped
-                            }
-                        }
-                        is StreamEvent.Complete -> {
-                            completedMessage = event.message
-                        }
-                    }
-                }
-
-                val rawResponse = completedMessage ?: ChatMessage("assistant", _streamingText.value)
-                val cleanContent = stripThinkTags(rawResponse.content)
-                val response = rawResponse.copy(content = cleanContent)
-                android.util.Log.d("AgentEngine", "chatStream: response content='${response.content.take(100)}', toolCalls=${response.toolCalls?.size ?: 0}, streamingLen=${_streamingText.value.length}")
+                val allowStreaming = iterationCount == 1
+                android.util.Log.d(
+                    "AgentEngine",
+                    "chatStream: requesting assistant round with ${aiMessages.size} msgs, ${tools.size} tools, allowStreaming=$allowStreaming"
+                )
+                val response = requestAssistantRound(
+                    aiMessages = aiMessages,
+                    tools = tools,
+                    allowStreaming = allowStreaming
+                )
+                val recoveredResponse = recoverToolCallIfNeeded(
+                    userMessage = userMessage,
+                    aiMessages = aiMessages,
+                    tools = tools,
+                    response = response,
+                    iteration = iterationCount,
+                    executedToolInRun = executedToolInRun
+                )
+                android.util.Log.d("AgentEngine", "chatStream: response content='${recoveredResponse.content.take(100)}', toolCalls=${recoveredResponse.toolCalls?.size ?: 0}, streamingLen=${_streamingText.value.length}")
                 _streamingText.value = ""
 
-                conversationManager.saveMessage(response)
-                messages.add(response)
+                try { conversationManager.saveMessage(recoveredResponse) } catch (_: Exception) {}
+                messages.add(recoveredResponse)
                 _conversationHistory.value = messages.toList()
                 android.util.Log.d("AgentEngine", "chatStream: history size=${messages.size}")
 
-                if (response.toolCalls.isNullOrEmpty()) {
+                if (recoveredResponse.toolCalls.isNullOrEmpty()) {
                     maybeSummarize()
                     return
                 }
 
                 // Execute tools (non-streaming)
-                for (toolCall in response.toolCalls) {
+                for (toolCall in recoveredResponse.toolCalls) {
+                    executedToolInRun = true
                     android.util.Log.d("AgentEngine", "chatStream: executing tool ${toolCall.name}")
-                    val result = executeTool(toolCall.name, toolCall.arguments)
+                    val result = executeToolSafely(toolCall.name, toolCall.arguments)
                     android.util.Log.d("AgentEngine", "chatStream: tool result='${result.take(100)}'")
                     val toolMsg = ChatMessage(role = "tool", content = "[${toolCall.name}] $result")
-                    conversationManager.saveMessage(toolMsg)
+                    try { conversationManager.saveMessage(toolMsg) } catch (_: Exception) {}
                     messages.add(toolMsg)
                 }
                 _conversationHistory.value = messages.toList()
             }
+
+            val limitMsg = ChatMessage(
+                role = "assistant",
+                content = "已达到最大执行轮数（$MAX_ITERATIONS），为避免长时间卡住，本次任务已停止。请尝试简化指令或分步执行。"
+            )
+            try { conversationManager.saveMessage(limitMsg) } catch (_: Exception) {}
+            messages.add(limitMsg)
+            _conversationHistory.value = messages.toList()
+            return
         } catch (e: kotlinx.coroutines.CancellationException) {
             android.util.Log.d("AgentEngine", "chatStream cancelled by user")
             _streamingText.value = ""
@@ -556,127 +774,250 @@ class AgentEngine private constructor(private val context: Context) {
         }
     }
 
+    private fun isPrecisionModeEnabled(): Boolean = deviceManager.precisionMode.value
+
+    private fun controllersForDeviceAction(shellPreferred: Boolean = false): List<DeviceController> {
+        return if (isPrecisionModeEnabled()) {
+            deviceManager.getControllersForRetry(shellPreferred = shellPreferred)
+        } else {
+            listOf(deviceManager.getActiveController())
+        }
+    }
+
+    private suspend fun runDeviceActionWithRetry(
+        actionName: String,
+        shellPreferred: Boolean = false,
+        block: suspend (DeviceController) -> Result<String>,
+    ): String {
+        val controllers = controllersForDeviceAction(shellPreferred = shellPreferred)
+        val errors = mutableListOf<String>()
+
+        for ((index, ctrl) in controllers.withIndex()) {
+            val result = try {
+                block(ctrl)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+            if (result.isSuccess) {
+                val output = result.getOrNull().orEmpty().ifBlank { "OK" }
+                if (index > 0 && isPrecisionModeEnabled()) {
+                    Log.w("AgentEngine", "$actionName succeeded by fallback controller=${ctrl.name}")
+                    return "$output（已回退到${ctrl.name}）"
+                }
+                return output
+            }
+
+            val err = result.exceptionOrNull()?.message ?: "unknown error"
+            Log.w("AgentEngine", "$actionName failed on ${ctrl.name}: $err")
+            errors.add("${ctrl.name}: $err")
+            if (!isPrecisionModeEnabled()) break
+        }
+
+        return "Error: ${errors.joinToString(" | ").ifEmpty { "unknown failure" }}"
+    }
+
+    private suspend fun readScreenWithFallback(controllers: List<DeviceController>): String {
+        for (ctrl in controllers) {
+            val text = ctrl.readScreen().getOrElse { "" }
+            if (isUsefulScreenText(text)) return text
+
+            val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
+            val a11yText = a11y?.readScreen() ?: ""
+            if (isUsefulScreenText(a11yText)) return a11yText
+
+            Log.d("AgentEngine", "readScreen: ${ctrl.name} result too short (${text.length}), trying uiautomator dump")
+            val dumpResult = try {
+                val dumpPath = "/sdcard/window_dump.xml"
+                ctrl.runShellCommand("uiautomator dump $dumpPath").getOrNull()
+                kotlinx.coroutines.delay(900)
+                val catResult = ctrl.runShellCommand("cat $dumpPath").getOrNull() ?: ""
+                ctrl.runShellCommand("rm $dumpPath")
+                if (catResult.length > 50) parseUiAutomatorDump(catResult) else ""
+            } catch (e: Exception) {
+                Log.w("AgentEngine", "readScreen uiautomator fallback failed on ${ctrl.name}", e)
+                ""
+            }
+            if (isUsefulScreenText(dumpResult)) return dumpResult
+        }
+
+        val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
+        val pkg = a11y?.getActivePackage() ?: "unknown"
+        val shellCtrl = deviceManager.getControllersForRetry(shellPreferred = true).firstOrNull()
+        val dumpsysRaw = if (shellCtrl != null) {
+            try {
+                shellCtrl.runShellCommand("dumpsys activity top | head -5").getOrNull() ?: ""
+            } catch (_: Exception) { "" }
+        } else ""
+        val dumpsys = if (dumpsysRaw.contains("Permission Denial", ignoreCase = true)) "" else dumpsysRaw
+
+        return "当前应用: $pkg\n" +
+            "屏幕内容无法通过无障碍服务读取(该应用可能不支持)。\n" +
+            "建议：优先开启精准模式，或启用 Shizuku/Root 后重试 device_read_screen；也可使用 device_screenshot 或坐标操作。\n" +
+            if (dumpsys.isNotEmpty()) "Activity信息: ${dumpsys.take(200)}" else ""
+    }
+
+    private fun isUsefulScreenText(text: String): Boolean {
+        if (text.isBlank()) return false
+        if (text.length < 50) return false
+        if (!text.contains("@[")) return false
+
+        // Multi-window mode from accessibility: require at least one non-systemui window
+        // that contains actionable node output, otherwise keep falling back.
+        if (text.contains("--- [window#")) {
+            val sectionRegex = Regex(
+                """--- \[window#\d+\]\[([^\]]+)\] ---([\s\S]*?)(?=--- \[window#\d+\]\[|$)"""
+            )
+            val sections = sectionRegex.findAll(text).toList()
+            if (sections.isNotEmpty()) {
+                val hasUsefulAppSection = sections.any { m ->
+                    val pkg = m.groupValues[1]
+                    val body = m.groupValues[2]
+                    pkg != "com.android.systemui" && body.contains("@[")
+                }
+                if (!hasUsefulAppSection) return false
+            }
+        }
+        return true
+    }
+
+    private fun buildShellInputCommand(text: String): String {
+        val escaped = text.replace("'", "'\\''")
+        return if (text.all { it.code < 128 }) {
+            "input text '${escaped.replace(" ", "%s")}'"
+        } else {
+            "am broadcast -a ADB_INPUT_TEXT --es msg '$escaped'"
+        }
+    }
+
+    private suspend fun tryInputTextWithController(ctrl: DeviceController, text: String): Result<String> {
+        val primary = ctrl.inputText(text)
+        if (primary.isSuccess) return primary
+
+        val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
+        if (a11y != null && pasteViaClipboard(a11y, text)) {
+            return Result.success("已输入(通过粘贴)")
+        }
+
+        return try {
+            ctrl.runShellCommand(buildShellInputCommand(text)).map {
+                if (it.isBlank() || it == "OK") "已输入(通过Shell)" else it
+            }
+        } catch (e: Exception) {
+            Result.failure(Exception("所有输入方式均失败 - ${e.message}"))
+        }
+    }
+
+    /**
+     * Returns:
+     * - true: text appears on current screen
+     * - false: screen readable but text not found
+     * - null: screen cannot be reliably read for verification
+     */
+    private suspend fun verifyTextInputApplied(text: String): Boolean? {
+        val normalizedToken = text.replace("\\s+".toRegex(), "").trim()
+        if (normalizedToken.length < 2) return null
+        val token = if (normalizedToken.length > 12) normalizedToken.takeLast(12) else normalizedToken
+
+        var screen = ""
+        for (ctrl in controllersForDeviceAction()) {
+            val content = ctrl.readScreen().getOrElse { "" }
+            if (content.length > 30) {
+                screen = content
+                break
+            }
+        }
+        if (screen.length <= 30) {
+            screen = com.phoneagent.device.AgentAccessibilityService.getInstance()?.readScreen().orEmpty()
+        }
+
+        if (screen.length <= 30) return null
+        val normalizedScreen = screen.replace("\\s+".toRegex(), "")
+        return normalizedScreen.contains(token)
+    }
+
     private suspend fun executeDeviceTool(name: String, arguments: Map<String, String>): String {
-        val ctrl = deviceManager.getActiveController()
         return when (name) {
             "device_read_screen" -> {
-                val result = ctrl.readScreen()
-                val text = result.getOrElse { "" }
-                if (text.length > 50) {
-                    text
-                } else {
-                    // Fallback 1: try accessibility service directly
-                    val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
-                    val a11yText = a11y?.readScreen() ?: ""
-                    if (a11yText.length > 50) {
-                        a11yText
-                    } else {
-                        // Fallback 2: try uiautomator dump via shell
-                        Log.d("AgentEngine", "readScreen: a11y too short (${a11yText.length}), trying uiautomator dump")
-                        val dumpResult = try {
-                            val dumpPath = "/sdcard/window_dump.xml"
-                            ctrl.runShellCommand("uiautomator dump $dumpPath").getOrNull()
-                            kotlinx.coroutines.delay(1000)
-                            val catResult = ctrl.runShellCommand("cat $dumpPath").getOrNull() ?: ""
-                            ctrl.runShellCommand("rm $dumpPath")
-                            if (catResult.length > 50) {
-                                parseUiAutomatorDump(catResult)
-                            } else ""
-                        } catch (e: Exception) {
-                            Log.w("AgentEngine", "uiautomator dump failed", e)
-                            ""
-                        }
-                        if (dumpResult.isNotEmpty()) {
-                            dumpResult
-                        } else {
-                            // Fallback 3: dumpsys to at least identify the current activity
-                            val dumpsys = try {
-                                ctrl.runShellCommand("dumpsys activity top | head -5").getOrNull() ?: ""
-                            } catch (_: Exception) { "" }
-                            val pkg = a11y?.getActivePackage() ?: "unknown"
-                            "当前应用: $pkg\n" +
-                            "屏幕内容无法通过无障碍服务读取(该应用可能不支持)。\n" +
-                            "建议：使用 device_screenshot 截图查看，或直接使用坐标操作。\n" +
-                            if (dumpsys.isNotEmpty()) "Activity信息: ${dumpsys.take(200)}" else ""
-                        }
-                    }
-                }
+                val readControllers =
+                    (controllersForDeviceAction() + deviceManager.getControllersForRetry(shellPreferred = true))
+                        .distinctBy { it.name }
+                readScreenWithFallback(readControllers)
             }
             "device_click_text" -> {
                 val text = arguments["text"] ?: return "Error: missing text"
-                val result = ctrl.clickByText(text).getOrElse { "Error: ${it.message}" }
+                val result = runDeviceActionWithRetry(name) { ctrl ->
+                    ctrl.clickByText(text).map { it.ifBlank { "已点击: $text" } }
+                }
                 kotlinx.coroutines.delay(500) // wait for UI to respond
                 result
             }
             "device_click_xy" -> {
                 val x = arguments["x"]?.toIntOrNull() ?: return "Error: invalid x"
                 val y = arguments["y"]?.toIntOrNull() ?: return "Error: invalid y"
-                val result = ctrl.clickAt(x, y).getOrElse { "Error: ${it.message}" }
+                val result = runDeviceActionWithRetry(name) { ctrl ->
+                    ctrl.clickAt(x, y).map { it.ifBlank { "已点击: ($x, $y)" } }
+                }
                 kotlinx.coroutines.delay(500) // wait for UI to respond
                 result
             }
             "device_input_text" -> {
                 val text = arguments["text"] ?: return "Error: missing text"
-                val inputResult = ctrl.inputText(text)
-                if (inputResult.isSuccess) {
-                    inputResult.getOrDefault("已输入")
-                } else {
-                    // Fallback 1: try accessibility service clipboard paste
-                    Log.d("AgentEngine", "inputText: primary failed, trying clipboard paste")
-                    val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
-                    if (a11y != null) {
-                        val pasted = pasteViaClipboard(a11y, text)
+                val result = runDeviceActionWithRetry(name) { ctrl -> tryInputTextWithController(ctrl, text) }
+                if (!isPrecisionModeEnabled()) return result
+
+                kotlinx.coroutines.delay(350)
+                when (verifyTextInputApplied(text)) {
+                    true, null -> result
+                    false -> {
+                        val a11y = com.phoneagent.device.AgentAccessibilityService.getInstance()
+                        val pasted = if (a11y != null) pasteViaClipboard(a11y, text) else false
                         if (pasted) {
-                            "已输入(通过粘贴)"
+                            kotlinx.coroutines.delay(250)
+                            val retried = verifyTextInputApplied(text)
+                            if (retried != false) "已输入(精准模式二次重试)" else "Warning: 输入可能未生效，请先点击输入框后重试。上次结果: $result"
                         } else {
-                            // Fallback 2: shell input
-                            Log.d("AgentEngine", "inputText: paste failed, trying shell")
-                            try {
-                                ctrl.runShellCommand("input text '${text.replace("'", "'\\''")}'").getOrElse {
-                                    "Error: 所有输入方式均失败 - ${it.message}"
-                                }
-                            } catch (e: Exception) {
-                                "Error: 输入失败 - ${e.message}"
-                            }
+                            "Warning: 输入可能未生效，请先点击输入框后重试。上次结果: $result"
                         }
-                    } else {
-                        inputResult.getOrElse { "Error: ${it.message}" }
                     }
                 }
             }
             "device_swipe" -> {
                 val dir = arguments["direction"] ?: return "Error: missing direction"
-                val (w, h) = ctrl.getScreenSize()
-                val cx = w / 2; val cy = h / 2; val offset = minOf(w, h) / 3
-                when (dir) {
-                    "up" -> ctrl.swipe(cx, cy + offset, cx, cy - offset)
-                    "down" -> ctrl.swipe(cx, cy - offset, cx, cy + offset)
-                    "left" -> ctrl.swipe(cx + offset, cy, cx - offset, cy)
-                    "right" -> ctrl.swipe(cx - offset, cy, cx + offset, cy)
-                    else -> Result.failure(Exception("Unknown direction: $dir"))
-                }.getOrElse { "Error: ${it.message}" }
+                runDeviceActionWithRetry(name) { ctrl ->
+                    val (w, h) = ctrl.getScreenSize()
+                    val cx = w / 2
+                    val cy = h / 2
+                    val offset = minOf(w, h) / 3
+                    when (dir) {
+                        "up" -> ctrl.swipe(cx, cy + offset, cx, cy - offset)
+                        "down" -> ctrl.swipe(cx, cy - offset, cx, cy + offset)
+                        "left" -> ctrl.swipe(cx + offset, cy, cx - offset, cy)
+                        "right" -> ctrl.swipe(cx - offset, cy, cx + offset, cy)
+                        else -> Result.failure(Exception("Unknown direction: $dir"))
+                    }
+                }
             }
             "device_press" -> {
                 val key = arguments["key"] ?: return "Error: missing key"
-                ctrl.pressKey(key).getOrElse { "Error: ${it.message}" }
+                runDeviceActionWithRetry(name) { ctrl -> ctrl.pressKey(key) }
             }
             "device_screenshot" -> {
                 val path = arguments["path"] ?: "/sdcard/Pictures/screenshot_${System.currentTimeMillis()}.png"
-                ctrl.screenshot(path).getOrElse { "Error: ${it.message}" }
+                runDeviceActionWithRetry(name, shellPreferred = true) { ctrl -> ctrl.screenshot(path) }
             }
             "device_shell" -> {
                 val command = arguments["command"] ?: return "Error: missing command"
-                ctrl.runShellCommand(command).getOrElse { "Error: ${it.message}" }
+                runDeviceActionWithRetry(name, shellPreferred = true) { ctrl -> ctrl.runShellCommand(command) }
             }
             "device_launch_app" -> {
                 val pkg = arguments["package"] ?: return "Error: missing package"
-                val result = ctrl.launchApp(pkg).getOrElse { "Error: ${it.message}" }
+                val result = runDeviceActionWithRetry(name) { ctrl -> ctrl.launchApp(pkg) }
                 kotlinx.coroutines.delay(2000) // wait for app to launch and render
                 result
             }
             "device_stop_app" -> {
                 val pkg = arguments["package"] ?: return "Error: missing package"
-                ctrl.forceStopApp(pkg).getOrElse { "Error: ${it.message}" }
+                runDeviceActionWithRetry(name, shellPreferred = true) { ctrl -> ctrl.forceStopApp(pkg) }
             }
             "device_send_sms" -> {
                 val to = arguments["to"] ?: return "Error: missing phone number"

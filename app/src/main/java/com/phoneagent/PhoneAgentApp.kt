@@ -54,6 +54,8 @@ class PhoneAgentApp : Application() {
         skillRegistry.register(SystemSettingsSkill(this))
         skillRegistry.register(FileManagerSkill(this))
         skillRegistry.register(ClipboardSkill(this))
+        skillRegistry.register(InstantMessageSkill(this))
+        skillRegistry.register(AutomationFlowSkill(this))
     }
 
     companion object {
